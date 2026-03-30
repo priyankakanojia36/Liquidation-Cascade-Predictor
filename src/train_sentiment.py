@@ -414,4 +414,6 @@ if __name__ == "__main__":
     print(f"    extremity, RSI deviation, volatility, price trend, and")
     print(f"    volume signals — analogous to CNN Fear & Greed Index")
     print(f"    but calibrated specifically for derivatives markets.'")
+
+
     
