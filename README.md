@@ -198,6 +198,9 @@ streamlit run dashboard/app.py
 
 Open `http://localhost:8501` in your browser.
 
+### 6. Refresh live data
+Click **"🔄 Refresh Live Data"** in the dashboard sidebar to fetch today's live prices, score all 5 models, and update DynamoDB in real time.
+
 ---
 
 ## ☁️ AWS Infrastructure
