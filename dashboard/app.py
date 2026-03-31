@@ -1,7 +1,7 @@
 """
 dashboard/app.py
 ================
-Day 5 Part 2: CascadeWatch Streamlit Dashboard
+CascadeWatch Streamlit Dashboard — Mode 2 (Live Refresh)
 
 HOW TO RUN:
     cd ~/projects/cascade-predictor
@@ -13,25 +13,27 @@ PAGES:
     3. Model Insights  — individual model score breakdown
     4. Backtest        — historical detection performance
 
-CONCEPT: Streamlit reruns this entire script top-to-bottom
-every time the user interacts with a widget. State is managed
-through st.session_state. Each st.* call renders one UI element.
+MODE 2 UPGRADE:
+    Added "Refresh Live Data" button in sidebar.
+    When clicked: fetches live market data, scores all 5 models,
+    writes results to DynamoDB, updates the gauge in real time.
+    Zero AWS cost unless button is clicked.
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-import plotly.express as px
 from plotly.subplots import make_subplots
 from pathlib import Path
-from sklearn.metrics import roc_auc_score, RocCurveDisplay
-import matplotlib.pyplot as plt
+import boto3
+import sys
+
+# Add src/ to path so we can import live_scorer
+sys.path.append(str(Path(__file__).parent.parent / "src"))
 
 # ---------------------------------------------------------------------------
-# PAGE CONFIG — must be the FIRST streamlit call in the script
-# CONCEPT: This sets the browser tab title, icon, and layout mode.
-# "wide" layout uses the full browser width instead of a narrow column.
+# PAGE CONFIG
 # ---------------------------------------------------------------------------
 st.set_page_config(
     page_title="CascadeWatch",
@@ -43,26 +45,63 @@ st.set_page_config(
 # ---------------------------------------------------------------------------
 # PATHS
 # ---------------------------------------------------------------------------
-ROOT         = Path(__file__).parent.parent  # project root
+ROOT         = Path(__file__).parent.parent
 FEATURES_DIR = ROOT / "data" / "features"
 MODELS_DIR   = ROOT / "data" / "models"
 DOCS_DIR     = ROOT / "docs"
 
+AWS_REGION     = "us-east-1"
+DYNAMODB_TABLE = "CascadeWatchRiskScores"
+
 
 # ===========================================================================
 # DATA LOADING
-# CONCEPT: @st.cache_data caches the result of this function.
-# Without caching, Streamlit would reload the Parquet file on EVERY
-# user interaction — making the app slow. With caching, it loads once
-# and reuses the result. The cache is invalidated when the file changes.
 # ===========================================================================
 
 @st.cache_data
 def load_data():
-    """Load ensemble scores — the main dataset for the dashboard."""
+    """Load historical ensemble scores from Parquet."""
     df = pd.read_parquet(FEATURES_DIR / "ensemble_scores.parquet")
     df = df.sort_index()
     return df
+
+
+@st.cache_data(ttl=0)
+def load_live_data_from_dynamodb():
+    """
+    Load the latest risk scores from DynamoDB.
+
+    CONCEPT: ttl=0 means never cache — always fetch fresh from DynamoDB.
+    This ensures every time the user refreshes, they see the latest
+    scores that were written by live_scorer.py.
+    """
+    try:
+        dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
+        table    = dynamodb.Table(DYNAMODB_TABLE)
+        response = table.scan()
+        items    = response.get("Items", [])
+
+        if not items:
+            return None
+
+        live = {}
+        for item in items:
+            sym = item["symbol"]
+            live[sym] = {
+                "risk_score":       float(item.get("risk_score", 0)),
+                "risk_level":       item.get("risk_level", "LOW"),
+                "close":            float(item.get("close", 0)),
+                "funding_rate":     float(item.get("funding_rate", 0)),
+                "last_updated":     item.get("last_updated", ""),
+                "score_classifier": float(item.get("score_classifier", 0)),
+                "score_anomaly":    float(item.get("score_anomaly", 0)),
+                "score_fear":       float(item.get("score_fear", 0)),
+                "score_severity":   float(item.get("score_severity", 0)),
+            }
+        return live
+
+    except Exception as e:
+        return None
 
 
 # ===========================================================================
@@ -70,15 +109,13 @@ def load_data():
 # ===========================================================================
 
 def get_risk_color(score):
-    """Return a color hex code based on risk score level."""
-    if score >= 75:   return "#da3633"   # red — critical
-    elif score >= 50: return "#d29922"   # orange — high
-    elif score >= 25: return "#3fb950"   # green — elevated
-    else:             return "#58a6ff"   # blue — low
+    if score >= 75:   return "#da3633"
+    elif score >= 50: return "#d29922"
+    elif score >= 25: return "#3fb950"
+    else:             return "#58a6ff"
 
 
 def get_risk_label(score):
-    """Return risk level label."""
     if score >= 75:   return "🔴 CRITICAL"
     elif score >= 50: return "🟠 HIGH"
     elif score >= 25: return "🟡 ELEVATED"
@@ -86,15 +123,7 @@ def get_risk_label(score):
 
 
 def make_gauge(score, title="CascadeWatch Risk Score"):
-    """
-    Create a Plotly gauge chart for the risk score.
-
-    CONCEPT: go.Indicator with mode="gauge+number" renders a
-    speedometer-style dial. We set color zones matching our
-    risk levels: blue=low, green=elevated, orange=high, red=critical.
-    """
     color = get_risk_color(score)
-
     fig = go.Figure(go.Indicator(
         mode="gauge+number+delta",
         value=score,
@@ -112,10 +141,10 @@ def make_gauge(score, title="CascadeWatch Risk Score"):
             "borderwidth": 2,
             "bordercolor": "#30363d",
             "steps": [
-                {"range": [0,  25], "color": "#0d419d"},   # LOW — blue
-                {"range": [25, 50], "color": "#1a7f37"},   # ELEVATED — green
-                {"range": [50, 75], "color": "#9e6a03"},   # HIGH — amber
-                {"range": [75, 100],"color": "#6e1c1c"},   # CRITICAL — red
+                {"range": [0,  25], "color": "#0d419d"},
+                {"range": [25, 50], "color": "#1a7f37"},
+                {"range": [50, 75], "color": "#9e6a03"},
+                {"range": [75, 100],"color": "#6e1c1c"},
             ],
             "threshold": {
                 "line": {"color": "white", "width": 3},
@@ -124,7 +153,6 @@ def make_gauge(score, title="CascadeWatch Risk Score"):
             }
         }
     ))
-
     fig.update_layout(
         height=280,
         paper_bgcolor="#0d1117",
@@ -140,10 +168,8 @@ def make_gauge(score, title="CascadeWatch Risk Score"):
 
 def render_sidebar(df):
     """
-    Sidebar: symbol selector, time range, and project info.
-
-    CONCEPT: st.sidebar.* renders elements in the left panel.
-    st.selectbox() creates a dropdown — returns the selected value.
+    Sidebar with symbol selector, live refresh button, and project info.
+    Returns: (symbol, live_data)
     """
     st.sidebar.image(
         "https://img.shields.io/badge/CascadeWatch-ML%20Risk%20System-blue",
@@ -160,46 +186,106 @@ def render_sidebar(df):
     )
 
     st.sidebar.divider()
+
+    # ------------------------------------------------------------------
+    # LIVE REFRESH BUTTON
+    # CONCEPT: When clicked, runs live_scorer.py which:
+    # 1. Fetches fresh API data
+    # 2. Scores all 5 models
+    # 3. Writes to DynamoDB
+    # 4. Clears Streamlit cache so the gauge updates
+    # AWS cost: ~$0.000001 per click (3 DynamoDB writes)
+    # ------------------------------------------------------------------
+    st.sidebar.markdown("**Live Data**")
+
+    if st.sidebar.button("🔄 Refresh Live Data", type="primary"):
+        with st.spinner("Fetching live market data..."):
+            try:
+                from live_scorer import run_live_scoring
+                results = run_live_scoring()
+                st.cache_data.clear()
+                st.sidebar.success("✅ Live data updated!")
+                for sym, data in results.items():
+                    st.sidebar.caption(
+                        f"{sym}: {data['risk_score']}/100 "
+                        f"({data['risk_level']}) @ "
+                        f"${data['close']:,.0f}"
+                    )
+            except Exception as e:
+                st.sidebar.error(f"Refresh failed: {e}")
+
+    # Load current DynamoDB data to show status
+    live = load_live_data_from_dynamodb()
+    if live:
+        st.sidebar.caption("🟢 Live data available")
+        for sym, data in live.items():
+            updated = data["last_updated"][:16].replace("T", " ")
+            st.sidebar.caption(
+                f"{sym}: **{data['risk_score']}/100** "
+                f"({data['risk_level']}) — {updated} UTC"
+            )
+    else:
+        st.sidebar.caption("⚪ Showing historical data")
+
+    st.sidebar.divider()
     st.sidebar.markdown("**Model Performance**")
     st.sidebar.metric("Ensemble AUC", "0.7229", "+0.09 vs best single")
     st.sidebar.metric("Cascades Detected", "4/56", "3.8h avg lead time")
     st.sidebar.markdown("**Data Period**")
-    st.sidebar.markdown("<small>Apr 2025 – Mar 2026 · 24,123 rows</small>",
-                        unsafe_allow_html=True)
+    st.sidebar.markdown(
+        "<small>Apr 2025 to Mar 2026 · 24,123 rows</small>",
+        unsafe_allow_html=True
+    )
 
     st.sidebar.divider()
     st.sidebar.markdown("**Built by**")
-    st.sidebar.markdown("[Priyanka Kanojia](https://linkedin.com/in/priyanka-datascience)")
-    st.sidebar.markdown("[GitHub](https://github.com/priyankakanojia36/"
-                        "Liquidation-Cascade-Predictor)")
+    st.sidebar.markdown(
+        "[Priyanka Kanojia](https://linkedin.com/in/priyanka-datascience)"
+    )
+    st.sidebar.markdown(
+        "[GitHub](https://github.com/priyankakanojia36/"
+        "Liquidation-Cascade-Predictor)"
+    )
 
-    return symbol
+    return symbol, live
 
 
 # ===========================================================================
 # PAGE 1: RISK OVERVIEW
 # ===========================================================================
 
-def page_risk_overview(df, symbol):
+def page_risk_overview(df, symbol, live):
     """
-    Main dashboard page showing the current risk score and alert status.
+    Main dashboard page. Shows live score if available,
+    otherwise falls back to historical data.
     """
     st.title("🌊 CascadeWatch Risk Overview")
-    st.caption(f"Real-time cascade risk assessment for {symbol}/USD")
 
-    # Filter to selected symbol
-    sym_df = df[df["symbol"] == symbol].copy()
+    # Use live DynamoDB data if available, otherwise use historical
+    if live and symbol in live:
+        live_sym      = live[symbol]
+        current_score = live_sym["risk_score"]
+        current_price = live_sym["close"]
+        funding_rate  = live_sym["funding_rate"]
+        last_updated  = live_sym["last_updated"][:16].replace("T", " ")
+        st.caption(
+            f"Live data for {symbol}/USD — last updated {last_updated} UTC"
+        )
+        data_source = "live"
+    else:
+        sym_df        = df[df["symbol"] == symbol].copy()
+        latest        = sym_df.iloc[-1]
+        current_score = latest["risk_score"]
+        current_price = latest["close"]
+        funding_rate  = latest["funding_rate"]
+        st.caption(
+            f"Historical data for {symbol}/USD — "
+            f"click Refresh for live data"
+        )
+        data_source = "historical"
 
-    # "Current" row = most recent timestamp in the data
-    latest = sym_df.iloc[-1]
-    current_score = latest["risk_score"]
-    risk_label    = get_risk_label(current_score)
+    risk_label = get_risk_label(current_score)
 
-    # -----------------------------------------------------------------------
-    # TOP ROW: gauge + key metrics
-    # CONCEPT: st.columns([2,1,1,1]) creates 4 columns with relative widths.
-    # The gauge gets 2 units of width, each metric gets 1.
-    # -----------------------------------------------------------------------
     col_gauge, col1, col2, col3 = st.columns([2, 1, 1, 1])
 
     with col_gauge:
@@ -207,77 +293,81 @@ def page_risk_overview(df, symbol):
         st.plotly_chart(fig_gauge, use_container_width=True)
 
     with col1:
-        st.metric(
-            label="Risk Level",
-            value=risk_label,
-        )
+        st.metric(label="Risk Level", value=risk_label)
         st.metric(
             label="Current Price",
-            value=f"${latest['close']:,.0f}",
+            value=f"${current_price:,.0f}",
+            delta="Live" if data_source == "live" else "Historical"
         )
 
     with col2:
         st.metric(
             label="Funding Rate",
-            value=f"{latest['funding_rate']*100:.4f}%",
+            value=f"{funding_rate*100:.4f}%",
             delta="vs neutral 0%"
         )
-        st.metric(
-            label="RSI (14h)",
-            value=f"{latest['rsi_14']:.1f}",
-            delta="overbought >70" if latest["rsi_14"] > 70
-                  else "oversold <30" if latest["rsi_14"] < 30
-                  else "neutral"
-        )
+        if data_source == "historical":
+            sym_df = df[df["symbol"] == symbol].copy()
+            latest = sym_df.iloc[-1]
+            st.metric(
+                label="RSI (14h)",
+                value=f"{latest['rsi_14']:.1f}",
+                delta="overbought >70" if latest["rsi_14"] > 70
+                      else "oversold <30" if latest["rsi_14"] < 30
+                      else "neutral"
+            )
 
     with col3:
-        st.metric(
-            label="Volume Ratio",
-            value=f"{latest['volume_ratio']:.2f}x",
-            delta="vs 24h average"
-        )
-        st.metric(
-            label="Fear Index",
-            value=f"{latest['fear_index']:.1f}/100",
-        )
+        if live and symbol in live:
+            live_sym = live[symbol]
+            st.metric(
+                label="Classifier Score",
+                value=f"{live_sym['score_classifier']:.3f}"
+            )
+            st.metric(
+                label="Fear Score",
+                value=f"{live_sym['score_fear']:.3f}"
+            )
+        elif data_source == "historical":
+            sym_df = df[df["symbol"] == symbol].copy()
+            latest = sym_df.iloc[-1]
+            st.metric(
+                label="Volume Ratio",
+                value=f"{latest['volume_ratio']:.2f}x",
+                delta="vs 24h average"
+            )
+            st.metric(
+                label="Fear Index",
+                value=f"{latest['fear_index']:.1f}/100"
+            )
 
     st.divider()
 
-    # -----------------------------------------------------------------------
-    # RISK SCORE TIMELINE
-    # CONCEPT: Plotly is used for interactive charts (zoom, hover, pan).
-    # go.Scatter() creates a line chart. add_hrect() adds horizontal
-    # shaded regions for risk zones.
-    # -----------------------------------------------------------------------
-    st.subheader(f"{symbol} Risk Score Timeline")
-
+    # Risk score timeline from historical data
+    st.subheader(f"{symbol} Risk Score Timeline (Historical)")
+    sym_df       = df[df["symbol"] == symbol].copy()
     cascade_rows = sym_df[sym_df["cascade_event"] == 1]
 
     fig = go.Figure()
-
-    # Risk score line
     fig.add_trace(go.Scatter(
-        x=sym_df.index,
-        y=sym_df["risk_score"],
-        mode="lines",
-        name="Risk Score",
+        x=sym_df.index, y=sym_df["risk_score"],
+        mode="lines", name="Risk Score",
         line=dict(color="#58a6ff", width=1),
-        fill="tozeroy",
-        fillcolor="rgba(88,166,255,0.1)"
+        fill="tozeroy", fillcolor="rgba(88,166,255,0.1)"
     ))
 
-    # Risk zone shading
     fig.add_hrect(y0=75, y1=100, fillcolor="#da3633",
                   opacity=0.08, line_width=0, annotation_text="CRITICAL")
-    fig.add_hrect(y0=50, y1=75,  fillcolor="#d29922",
+    fig.add_hrect(y0=50, y1=75, fillcolor="#d29922",
                   opacity=0.06, line_width=0, annotation_text="HIGH")
-    fig.add_hrect(y0=25, y1=50,  fillcolor="#3fb950",
+    fig.add_hrect(y0=25, y1=50, fillcolor="#3fb950",
                   opacity=0.04, line_width=0, annotation_text="ELEVATED")
 
-    # Cascade event markers
     for t in cascade_rows.index:
         fig.add_vline(x=t, line_color="#da3633",
                       line_dash="dash", line_width=1.5, opacity=0.8)
+
+    # Live score shown in sidebar — no chart marker needed
 
     fig.update_layout(
         height=350,
@@ -290,7 +380,6 @@ def page_risk_overview(df, symbol):
         legend=dict(bgcolor="#161b22"),
         margin=dict(t=20, b=40)
     )
-
     st.plotly_chart(fig, use_container_width=True)
 
 
@@ -299,54 +388,40 @@ def page_risk_overview(df, symbol):
 # ===========================================================================
 
 def page_market_data(df, symbol):
-    """Price chart + funding rate + RSI for selected symbol."""
     st.title(f"📈 {symbol} Market Data")
-
-    sym_df = df[df["symbol"] == symbol].copy()
+    sym_df       = df[df["symbol"] == symbol].copy()
     cascade_rows = sym_df[sym_df["cascade_event"] == 1]
 
-    # 3-panel chart: price, funding, RSI
     fig = make_subplots(
-        rows=3, cols=1,
-        shared_xaxes=True,
+        rows=3, cols=1, shared_xaxes=True,
         row_heights=[0.5, 0.25, 0.25],
         subplot_titles=["Price (USD)", "Funding Rate (%)", "RSI (14h)"],
         vertical_spacing=0.06
     )
 
-    # Panel 1: Price
     fig.add_trace(go.Scatter(
         x=sym_df.index, y=sym_df["close"],
         name="Price", line=dict(color="#58a6ff", width=1)
     ), row=1, col=1)
 
-    # Panel 2: Funding rate
     fig.add_trace(go.Scatter(
-        x=sym_df.index,
-        y=sym_df["funding_rate"] * 100,
-        name="Funding Rate %",
-        line=dict(color="#3fb950", width=0.8),
-        fill="tozeroy",
-        fillcolor="rgba(63,185,80,0.1)"
+        x=sym_df.index, y=sym_df["funding_rate"] * 100,
+        name="Funding Rate %", line=dict(color="#3fb950", width=0.8),
+        fill="tozeroy", fillcolor="rgba(63,185,80,0.1)"
     ), row=2, col=1)
 
-    # Funding rate zero line
-    fig.add_hline(y=0, line_color="#8b949e",
-                  line_width=0.5, row=2, col=1)
+    fig.add_hline(y=0, line_color="#8b949e", line_width=0.5, row=2, col=1)
 
-    # Panel 3: RSI
     fig.add_trace(go.Scatter(
         x=sym_df.index, y=sym_df["rsi_14"],
         name="RSI", line=dict(color="#bc8cff", width=0.8)
     ), row=3, col=1)
 
-    # RSI overbought/oversold lines
     fig.add_hline(y=70, line_color="#da3633", line_dash="dot",
                   line_width=1, row=3, col=1)
     fig.add_hline(y=30, line_color="#da3633", line_dash="dot",
                   line_width=1, row=3, col=1)
 
-    # Cascade markers on all panels
     for t in cascade_rows.index:
         for row in [1, 2, 3]:
             fig.add_vline(x=t, line_color="#da3633",
@@ -354,19 +429,14 @@ def page_market_data(df, symbol):
                           opacity=0.7, row=row, col=1)
 
     fig.update_layout(
-        height=700,
-        paper_bgcolor="#0d1117",
-        plot_bgcolor="#161b22",
-        font=dict(color="#e6edf3"),
-        showlegend=True,
+        height=700, paper_bgcolor="#0d1117", plot_bgcolor="#161b22",
+        font=dict(color="#e6edf3"), showlegend=True,
         legend=dict(bgcolor="#161b22"),
     )
     fig.update_xaxes(gridcolor="#21262d")
     fig.update_yaxes(gridcolor="#21262d")
-
     st.plotly_chart(fig, use_container_width=True)
 
-    # Cascade event table
     if len(cascade_rows) > 0:
         st.subheader(f"{symbol} Cascade Events Detected")
         display_cols = ["close", "risk_score", "risk_level",
@@ -374,10 +444,8 @@ def page_market_data(df, symbol):
         available = [c for c in display_cols if c in cascade_rows.columns]
         st.dataframe(
             cascade_rows[available].style.format({
-                "close": "${:,.0f}",
-                "risk_score": "{:.1f}",
-                "funding_rate": "{:.6f}",
-                "rsi_14": "{:.1f}",
+                "close": "${:,.0f}", "risk_score": "{:.1f}",
+                "funding_rate": "{:.6f}", "rsi_14": "{:.1f}",
                 "volume_ratio": "{:.2f}x"
             }),
             use_container_width=True
@@ -388,29 +456,37 @@ def page_market_data(df, symbol):
 # PAGE 3: MODEL INSIGHTS
 # ===========================================================================
 
-def page_model_insights(df, symbol):
-    """Individual model score breakdown and feature contributions."""
+def page_model_insights(df, symbol, live):
     st.title("🧠 Model Insights")
     st.caption("How each of the 5 models contributes to the ensemble score")
 
     sym_df = df[df["symbol"] == symbol].copy()
     latest = sym_df.iloc[-1]
 
-    # Model score breakdown for latest row
+    # Use live scores if available
+    if live and symbol in live:
+        live_sym = live[symbol]
+        score_data = {
+            "Classifier (w=0.35)":  live_sym["score_classifier"] * 0.35 * 100,
+            "Anomaly (w=0.25)":     live_sym["score_anomaly"]    * 0.25 * 100,
+            "Fear Index (w=0.20)":  live_sym["score_fear"]       * 0.20 * 100,
+            "Severity (w=0.10)":    live_sym["score_severity"]   * 0.10 * 100,
+            "Survival (w=0.10)":    0.0,
+        }
+        st.caption("Showing live model scores from DynamoDB")
+    else:
+        score_data = {
+            "Classifier (w=0.35)":  latest.get("score_classifier", 0) * 0.35 * 100,
+            "Anomaly (w=0.25)":     latest.get("score_anomaly", 0)    * 0.25 * 100,
+            "Fear Index (w=0.20)":  latest.get("score_fear", 0)       * 0.20 * 100,
+            "Severity (w=0.10)":    latest.get("score_severity", 0)   * 0.10 * 100,
+            "Survival (w=0.10)":    latest.get("score_survival", 0)   * 0.10 * 100,
+        }
+
     st.subheader("Current Score Decomposition")
-
-    score_data = {
-        "Classifier (w=0.35)":   latest.get("score_classifier", 0) * 0.35 * 100,
-        "Anomaly (w=0.25)":      latest.get("score_anomaly", 0)    * 0.25 * 100,
-        "Fear Index (w=0.20)":   latest.get("score_fear", 0)       * 0.20 * 100,
-        "Severity (w=0.10)":     latest.get("score_severity", 0)   * 0.10 * 100,
-        "Survival (w=0.10)":     latest.get("score_survival", 0)   * 0.10 * 100,
-    }
-
     col1, col2 = st.columns(2)
 
     with col1:
-        # Bar chart of contributions
         fig = go.Figure(go.Bar(
             x=list(score_data.values()),
             y=list(score_data.keys()),
@@ -422,9 +498,7 @@ def page_model_insights(df, symbol):
         ))
         fig.update_layout(
             title="Score Contribution per Model (out of 100)",
-            height=300,
-            paper_bgcolor="#0d1117",
-            plot_bgcolor="#161b22",
+            height=300, paper_bgcolor="#0d1117", plot_bgcolor="#161b22",
             font=dict(color="#e6edf3"),
             xaxis=dict(range=[0, 50], gridcolor="#21262d"),
             yaxis=dict(gridcolor="#21262d"),
@@ -433,61 +507,64 @@ def page_model_insights(df, symbol):
         st.plotly_chart(fig, use_container_width=True)
 
     with col2:
-        # Raw scores table
         st.markdown("**Raw model scores (0-1)**")
-        raw_scores = {
-            "Model": ["Classifier", "Anomaly Detector",
-                      "Fear Index", "Severity", "Survival"],
-            "Raw Score": [
-                f"{latest.get('score_classifier', 0):.4f}",
-                f"{latest.get('score_anomaly', 0):.4f}",
-                f"{latest.get('score_fear', 0):.4f}",
-                f"{latest.get('score_severity', 0):.4f}",
-                f"{latest.get('score_survival', 0):.4f}",
-            ],
-            "Weight": ["35%", "25%", "20%", "10%", "10%"],
-            "Contribution": [f"{v:.1f}" for v in score_data.values()]
-        }
+        if live and symbol in live:
+            live_sym = live[symbol]
+            raw_scores = {
+                "Model": ["Classifier", "Anomaly", "Fear Index",
+                          "Severity", "Survival"],
+                "Raw Score": [
+                    f"{live_sym['score_classifier']:.4f}",
+                    f"{live_sym['score_anomaly']:.4f}",
+                    f"{live_sym['score_fear']:.4f}",
+                    f"{live_sym['score_severity']:.4f}",
+                    "0.0000",
+                ],
+                "Weight": ["35%", "25%", "20%", "10%", "10%"],
+                "Contribution": [f"{v:.1f}" for v in score_data.values()]
+            }
+        else:
+            raw_scores = {
+                "Model": ["Classifier", "Anomaly", "Fear Index",
+                          "Severity", "Survival"],
+                "Raw Score": [
+                    f"{latest.get('score_classifier', 0):.4f}",
+                    f"{latest.get('score_anomaly', 0):.4f}",
+                    f"{latest.get('score_fear', 0):.4f}",
+                    f"{latest.get('score_severity', 0):.4f}",
+                    f"{latest.get('score_survival', 0):.4f}",
+                ],
+                "Weight": ["35%", "25%", "20%", "10%", "10%"],
+                "Contribution": [f"{v:.1f}" for v in score_data.values()]
+            }
         st.dataframe(pd.DataFrame(raw_scores), use_container_width=True)
 
     st.divider()
-
-    # Score timelines for all models
-    st.subheader("Model Score Timelines")
+    st.subheader("Model Score Timelines (Historical)")
 
     fig2 = go.Figure()
-    model_scores = {
-        "Classifier":     ("score_classifier", "#58a6ff"),
-        "Anomaly":        ("score_anomaly",    "#3fb950"),
-        "Fear Index":     ("score_fear",       "#d29922"),
-        "Severity":       ("score_severity",   "#bc8cff"),
-    }
-
-    for name, (col, color) in model_scores.items():
+    for name, (col, color) in {
+        "Classifier": ("score_classifier", "#58a6ff"),
+        "Anomaly":    ("score_anomaly",    "#3fb950"),
+        "Fear Index": ("score_fear",       "#d29922"),
+        "Severity":   ("score_severity",   "#bc8cff"),
+    }.items():
         if col in sym_df.columns:
             fig2.add_trace(go.Scatter(
-                x=sym_df.index,
-                y=sym_df[col],
-                name=name,
-                line=dict(color=color, width=0.8),
-                opacity=0.8
+                x=sym_df.index, y=sym_df[col],
+                name=name, line=dict(color=color, width=0.8), opacity=0.8
             ))
 
-    cascade_rows = sym_df[sym_df["cascade_event"] == 1]
-    for t in cascade_rows.index:
+    for t in sym_df[sym_df["cascade_event"] == 1].index:
         fig2.add_vline(x=t, line_color="#da3633",
                        line_dash="dash", line_width=1.5, opacity=0.8)
 
     fig2.update_layout(
-        height=350,
-        paper_bgcolor="#0d1117",
-        plot_bgcolor="#161b22",
+        height=350, paper_bgcolor="#0d1117", plot_bgcolor="#161b22",
         font=dict(color="#e6edf3"),
-        yaxis=dict(range=[0, 1], title="Score (0-1)",
-                   gridcolor="#21262d"),
+        yaxis=dict(range=[0, 1], title="Score (0-1)", gridcolor="#21262d"),
         xaxis=dict(gridcolor="#21262d"),
-        legend=dict(bgcolor="#161b22"),
-        margin=dict(t=20, b=40)
+        legend=dict(bgcolor="#161b22"), margin=dict(t=20, b=40)
     )
     st.plotly_chart(fig2, use_container_width=True)
 
@@ -497,23 +574,16 @@ def page_model_insights(df, symbol):
 # ===========================================================================
 
 def page_backtest(df):
-    """Historical backtest metrics and ROC curve."""
     st.title("📊 Backtest Performance")
     st.caption("How well did CascadeWatch detect historical cascade events?")
 
-    # Key metrics
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Ensemble AUC-ROC", "0.7229",
-                "+9pp vs best single model")
-    col2.metric("Cascades Detected", "4 / 56",
-                "at threshold 50/100")
-    col3.metric("Avg Lead Time", "3.8 hours",
-                "before cascade onset")
-    col4.metric("Best Single Model", "Fear Index 0.6266",
-                "AUC before ensemble")
+    col1.metric("Ensemble AUC-ROC", "0.7229", "+9pp vs best single model")
+    col2.metric("Cascades Detected", "4 / 56", "at threshold 50/100")
+    col3.metric("Avg Lead Time", "3.8 hours", "before cascade onset")
+    col4.metric("Best Single Model", "Fear Index 0.6266", "AUC before ensemble")
 
     st.divider()
-
     col_left, col_right = st.columns(2)
 
     with col_left:
@@ -538,15 +608,11 @@ def page_backtest(df):
         fig.add_vline(x=cascade.mean(), line_color="#da3633",
                       line_dash="dash",
                       annotation_text=f"Cascade mean: {cascade.mean():.1f}")
-        fig.add_vline(x=50, line_color="white",
-                      line_dash="dot",
+        fig.add_vline(x=50, line_color="white", line_dash="dot",
                       annotation_text="Alert threshold")
-
         fig.update_layout(
-            barmode="overlay",
-            height=350,
-            paper_bgcolor="#0d1117",
-            plot_bgcolor="#161b22",
+            barmode="overlay", height=350,
+            paper_bgcolor="#0d1117", plot_bgcolor="#161b22",
             font=dict(color="#e6edf3"),
             xaxis=dict(title="Risk Score", gridcolor="#21262d"),
             yaxis=dict(title="Density", gridcolor="#21262d"),
@@ -556,71 +622,52 @@ def page_backtest(df):
 
     with col_right:
         st.subheader("Model Comparison Summary")
-
         model_results = pd.DataFrame({
-            "Model": ["Logistic Regression", "Random Forest",
-                      "XGBoost", "LightGBM",
-                      "Anomaly Detector", "Fear Index",
+            "Model": ["Logistic Regression", "Random Forest", "XGBoost",
+                      "LightGBM", "Anomaly Detector", "Fear Index",
                       "🌊 Ensemble"],
             "AUC-ROC": [0.5563, 0.5307, 0.5228, 0.5352,
                         0.5922, 0.6266, 0.7229],
-            "Type": ["Supervised", "Supervised",
-                     "Supervised", "Supervised",
-                     "Unsupervised", "Rule-based",
-                     "Ensemble"],
-        })
-        model_results = model_results.sort_values(
-            "AUC-ROC", ascending=True)
+        }).sort_values("AUC-ROC", ascending=True)
 
         fig2 = go.Figure(go.Bar(
-            x=model_results["AUC-ROC"],
-            y=model_results["Model"],
+            x=model_results["AUC-ROC"], y=model_results["Model"],
             orientation="h",
-            marker_color=[
-                "#da3633" if m == "🌊 Ensemble" else "#58a6ff"
-                for m in model_results["Model"]
-            ],
+            marker_color=["#da3633" if m == "🌊 Ensemble" else "#58a6ff"
+                          for m in model_results["Model"]],
             text=[f"{v:.4f}" for v in model_results["AUC-ROC"]],
             textposition="outside"
         ))
-        fig2.add_vline(x=0.5, line_color="#8b949e",
-                       line_dash="dot",
+        fig2.add_vline(x=0.5, line_color="#8b949e", line_dash="dot",
                        annotation_text="Random (0.5)")
-
         fig2.update_layout(
-            height=350,
-            paper_bgcolor="#0d1117",
-            plot_bgcolor="#161b22",
+            height=350, paper_bgcolor="#0d1117", plot_bgcolor="#161b22",
             font=dict(color="#e6edf3"),
-            xaxis=dict(range=[0.45, 0.80],
-                       title="AUC-ROC", gridcolor="#21262d"),
-            yaxis=dict(gridcolor="#21262d"),
-            margin=dict(t=20, r=60)
+            xaxis=dict(range=[0.45, 0.80], title="AUC-ROC",
+                       gridcolor="#21262d"),
+            yaxis=dict(gridcolor="#21262d"), margin=dict(t=20, r=60)
         )
         st.plotly_chart(fig2, use_container_width=True)
 
-    # Key findings
     st.divider()
     st.subheader("Key Findings")
-
     findings = {
         "🔑 Funding signals predict occurrence":
             "consecutive_positive_funding and funding_zscore are the top "
-            "features in the classifier — leverage buildup precedes cascades.",
+            "features in the classifier. Leverage buildup precedes cascades.",
         "📊 Volume signals predict severity":
-            "volume_ratio is the #1 feature in the severity model — panic "
-            "selling magnitude correlates with pre-crash volume spikes.",
+            "volume_ratio is the #1 severity feature. Panic selling "
+            "magnitude correlates with pre-crash volume spikes.",
         "⏱️ RSI gives 2-hour warning":
-            "EDA showed RSI begins declining ~2 hours before cascade onset "
-            "on average — the clearest leading indicator in the dataset.",
+            "RSI begins declining approximately 2 hours before cascade "
+            "onset on average. The clearest leading indicator in the dataset.",
         "🌐 Cross-asset contagion matters":
-            "btc_sol_corr_24h ranked 3rd in XGBoost importance — when BTC "
+            "btc_sol_corr_24h ranked 3rd in XGBoost importance. When BTC "
             "and SOL decouple, cascades are more likely.",
         "🤝 Ensemble beats every single model":
-            "AUC 0.7229 ensemble vs 0.6266 best single — combining 5 "
+            "AUC 0.7229 ensemble vs 0.6266 best single. Combining 5 "
             "models with different failure modes improves overall detection."
     }
-
     for title, desc in findings.items():
         with st.expander(title):
             st.write(desc)
@@ -631,23 +678,14 @@ def page_backtest(df):
 # ===========================================================================
 
 def main():
-    """
-    Main app entry point.
-
-    CONCEPT: st.sidebar.radio() creates a navigation menu.
-    The selected page name is stored in `page` variable.
-    We then call the corresponding page function.
-    """
-    # Load data
     try:
         df = load_data()
     except FileNotFoundError:
-        st.error("ensemble_scores.parquet not found. "
-                 "Run src/ensemble.py first.")
+        st.error("ensemble_scores.parquet not found. Run src/ensemble.py first.")
         st.stop()
 
-    # Sidebar navigation
-    symbol = render_sidebar(df)
+    # Sidebar returns symbol AND live data from DynamoDB
+    symbol, live = render_sidebar(df)
 
     page = st.sidebar.radio(
         "Navigate",
@@ -658,13 +696,12 @@ def main():
         index=0
     )
 
-    # Route to selected page
     if page == "🏠 Risk Overview":
-        page_risk_overview(df, symbol)
+        page_risk_overview(df, symbol, live)
     elif page == "📈 Market Data":
         page_market_data(df, symbol)
     elif page == "🧠 Model Insights":
-        page_model_insights(df, symbol)
+        page_model_insights(df, symbol, live)
     elif page == "📊 Backtest Performance":
         page_backtest(df)
 
