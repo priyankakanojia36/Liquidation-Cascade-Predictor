@@ -7,6 +7,9 @@
 [![Streamlit](https://img.shields.io/badge/Dashboard-Streamlit-red)](https://streamlit.io)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
+## 🚀 [Launch Dashboard](http://localhost:8501) | [View on GitHub](https://github.com/priyankakanojia36/Liquidation-Cascade-Predictor)
+
+> **To run locally:** `streamlit run dashboard/app.py` then open `http://localhost:8501`
 ---
 
 ## 🎯 The Problem
@@ -29,6 +32,20 @@ On October 10, 2025, the crypto market lost over $2 billion in liquidations with
 | Training data | 24,123 hourly rows (Apr 2025 to Mar 2026) |
 | Symbols covered | BTC, ETH, SOL |
 
+---
+## 📸 Screenshots
+
+### Ensemble Risk Score Timeline
+![Ensemble Risk Score](docs/plot_ensemble_risk_score.png)
+
+### Feature Distributions: Normal vs Pre-Cascade
+![Feature Distributions](docs/plot_feature_distributions.png)
+
+### Cascade Fingerprint
+![Cascade Fingerprint](docs/plot_cascade_fingerprint.png)
+
+### Model Comparison
+![Model Comparison](docs/plot_model_comparison.png)
 ---
 
 ## 🏗️ System Architecture
